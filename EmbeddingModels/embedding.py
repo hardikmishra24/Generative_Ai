@@ -1,10 +1,9 @@
-from google import genai
+from dotenv import load_dotenv
+load_dotenv()
 
-client = genai.Client()
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
 
-result = client.models.embed_content(
-        model="gemini-embedding-2",
-        contents="What is the meaning of life?"
-)
+embeddings = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001", dimesions=100)
 
-print(result.embeddings)
+response = embeddings.embed_query("What is the meaning of life?")
+print(response)
