@@ -29,5 +29,4 @@ final_prompt = prompt.invoke({"paragraph": para,'format_instructions': parser.ge
 response = model.invoke(final_prompt)
 
 print(response.content[0]["text"])
-
-print(movie)
+print(movie) 
