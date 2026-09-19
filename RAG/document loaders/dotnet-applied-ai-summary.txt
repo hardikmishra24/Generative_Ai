@@ -1,0 +1,483 @@
+==============================================================================
+ .NET & APPLIED AI - MASTER REFERENCE: SUMMARY + EXTRA NOTES
+==============================================================================
+Source: "dotnet-applied-ai-master-guide" (written against the ecosystem as of
+19 September 2026). Part A summarizes the guide. Part B contains points I am
+adding on top of it.
+
+Note: ecosystem/version claims in Part A are taken from the guide itself. I
+have not independently verified them, and the guide tells you to re-check
+them before relying on them.
+
+
+==============================================================================
+PART A - SUMMARY OF THE GUIDE
+==============================================================================
+
+WHAT IT IS
+----------
+An engineering guide (no marketing) for building AI-enabled backends in
+C# / ASP.NET Core. Each chapter follows the same shape: learning objectives,
+concepts, implementation code, failure modes, exercises. Code targets
+C# 12+ / .NET 8+. Suggested effort is about 83-132 hours total:
+
+  Ch 1  .NET & C# foundations        15-25 h
+  Ch 2  Applied AI fundamentals       8-12 h
+  Ch 3  AI in .NET                   20-30 h
+  Ch 4  Integration patterns         25-40 h
+  Ch 5  Deployment & scaling         15-25 h
+
+Placeholders you must fill in yourself: [SPECIFIC_AI_MODEL_VERSION],
+[SPECIFIC_EMBEDDING_MODEL_VERSION], [EMBEDDING_DIMENSIONS] (must match the
+vector column exactly), [CLOUD_PROVIDER_NAME], and the per-million-token
+prices. The guide deliberately avoids hard-coding prices or package versions
+because they go stale.
+
+
+SECTION 0 - ECOSYSTEM STATUS (as claimed by the guide, Sept 2026)
+-----------------------------------------------------------------
+- .NET 10 is the current LTS (to Nov 2028). .NET 8 and .NET 9 both end
+  support in Nov 2026. Start new services on .NET 10.
+- Microsoft.Extensions.AI (IChatClient, IEmbeddingGenerator) is the shared
+  foundation. Program against these interfaces; they survive framework churn.
+- Semantic Kernel (SK) -> Microsoft Agent Framework: an official migration
+  guide exists and Agent Framework reached 1.0 GA. SK is still what most
+  existing code uses.
+- Vector data: Microsoft.Extensions.VectorData.Abstractions is the layer;
+  SK's connectors are being repackaged as CommunityToolkit.VectorData.*.
+- Kernel Memory: last stable release May 2025 and possibly deprecated. Treat
+  as legacy.
+- ML.NET: mature, stable, CPU-oriented; still right for cheap, deterministic,
+  on-box classification.
+- None of the code snippets were compiled. Pin versions, compile, read
+  release notes. APIs most likely to have shifted: Agent Framework 1.0,
+  CommunityToolkit.VectorData.* constructors, Kernel Memory.
+
+
+CHAPTER 1 - CORE .NET & C# FOUNDATIONS
+--------------------------------------
+Runtime
+- C# -> IL (Roslyn) -> machine code (CoreCLR). Tiered compilation with
+  dynamic PGO (default since .NET 8). ReadyToRun cuts startup. Native AOT
+  restricts reflection, so reflection-heavy libraries (incl. Semantic
+  Kernel) are a poor fit. Don't use AOT for AI services without a measured
+  need.
+- GC in containers: the runtime already caps the heap at 75% of the memory
+  limit. Change it via the decimal System.GC.HeapHardLimitPercent in
+  runtimeconfig.json. DOTNET_GC* env vars are parsed as HEXADECIMAL.
+  Measure with dotnet-counters before touching anything. DATAS is the
+  default for Server GC since .NET 9.
+
+Modern C#
+- C# 12: primary constructors, collection expressions, InlineArray.
+- C# 13: params collections, System.Threading.Lock.
+- C# 14 (.NET 10): the `field` keyword, extension members, null-conditional
+  assignment.
+- Records, required members, pattern matching for routing logic,
+  TensorPrimitives (SIMD cosine similarity), source-generated JSON.
+- Brute-force vector scan is fine to ~10^4-10^5 vectors; beyond that use an
+  ANN index (a vector database).
+- Other useful APIs: keyed DI services, TimeProvider, Task.WhenEach,
+  HybridCache, JsonSchemaExporter.
+
+Async
+- Pass CancellationToken everywhere; HttpContext.RequestAborted stops paying
+  for tokens nobody reads.
+- Timeout budgets via linked CancellationTokenSource + CancelAfter.
+- Bounded concurrency (Parallel.ForEachAsync with MaxDegreeOfParallelism)
+  instead of unbounded Task.WhenAll (which causes 429s and big bills).
+- Bounded Channels for producer/consumer ingestion with backpressure.
+- IAsyncEnumerable for streaming; Task.WhenEach for fan-out.
+- Anti-patterns: .Result/.Wait(), async void, fire-and-forget, Task.Run
+  around I/O, new HttpClient() per call, unbounded parallel LLM calls.
+
+ASP.NET Core
+- Pipeline order: exception handler -> authN/authZ -> rate limiting ->
+  endpoint. DI lifetimes matter (no scoped in singleton).
+- Options pattern with ValidateDataAnnotations + ValidateOnStart, so bad
+  config crashes the deploy instead of the first user.
+- Resilience (AddStandardResilienceHandler): the DEFAULT 30 s total timeout
+  will kill long LLM generations. Total timeout must exceed attempt timeout;
+  circuit-breaker sampling duration must be >= 2x attempt timeout.
+- SSE streaming endpoint with X-Accel-Buffering: no to stop proxy buffering.
+
+
+CHAPTER 2 - APPLIED AI FUNDAMENTALS
+-----------------------------------
+ML essentials
+- Train/validation/test splits; touch the test set once. Watch for
+  overfitting, data leakage, class imbalance.
+- Precision = TP/(TP+FP); Recall = TP/(TP+FN); F1 = harmonic mean. Accuracy
+  misleads on imbalanced data. PR-AUC beats ROC-AUC when positives are rare.
+- Choose thresholds from the cost of errors, not 0.5 (auto-delete needs high
+  precision; human-review queue needs high recall).
+
+Classical ML vs LLM
+- Classical: sub-ms latency, ~zero marginal cost, deterministic, needs
+  labels, weak on novel phrasing, data stays on-box.
+- LLM: 300 ms to seconds, per-token cost, non-deterministic, often zero-shot,
+  strong on novel input, data leaves your boundary unless self-hosted.
+- Practical pattern: cheap classical model first, LLM only for the ambiguous
+  middle band (often cuts LLM spend by ~10x on high-volume streams).
+
+Neural nets / LLMs
+- Neuron = f(w.x + b); softmax with temperature is exactly what LLM sampling
+  does to logits.
+- Tokens are subwords (~4 chars / 0.75 words in English); non-Latin scripts
+  can cost 2-4x more tokens.
+- Transformer = embeddings + positions -> N x (self-attention + FFN) ->
+  logits. Generation is autoregressive. Latency ~ time-to-first-token +
+  output tokens x per-token time.
+- System prompt is guidance, not a security boundary. The model never
+  executes tools - your code does.
+- Sampling: temperature 0-0.3 for extraction/RAG; change temperature OR
+  top_p, not both; ALWAYS set max_output_tokens (worst-case cost limiter).
+- Reasoning models bill hidden "thinking" tokens and add latency.
+- Cost arithmetic example: ~3,100 input + 400 output tokens per RAG query;
+  at 10k queries/day that is ~31M input tokens/day (~930M/month). Compute
+  this with real prices BEFORE building.
+
+Embeddings
+- Cosine (default for text), dot product (equals cosine if normalized), L2
+  (lower = better). Always check whether higher or lower is better.
+- Vector column size must equal model output. Changing embedding model means
+  re-embedding everything; vectors from different models aren't comparable.
+- HNSW parameters: M, ef_construct, ef. Quantization saves 4-32x memory at
+  some recall cost; re-rank with full-precision vectors.
+
+Failure modes table (mitigations)
+- Hallucination -> ground in context, citations, allow "I don't know".
+- Prompt injection -> treat retrieved text as data, least-privilege tools,
+  output validation, human approval for side effects.
+- Retrieval miss -> measure recall@k, hybrid search, rerank, better chunking.
+- Lost in the middle -> fewer, better chunks.
+- Cross-tenant leakage -> tenant filter from the auth token, never the body.
+- Unbounded consumption -> output caps, iteration caps, budgets.
+- Stale index, provider outage/drift -> idempotent re-ingestion, fallback
+  provider, pinned model versions, regression evals.
+
+Evaluation
+- Golden set of 50-200 real questions BEFORE tuning. Measure retrieval
+  (recall@k, MRR, nDCG) first - it needs no LLM. Then generation
+  (faithfulness, answer relevance, refusal correctness).
+- LLM-as-judge has position/verbosity/self-preference bias; calibrate on
+  30-50 human labels. Gate CI on the golden set.
+
+
+CHAPTER 3 - AI IN .NET
+----------------------
+Design rule: domain code depends on IChatClient, IEmbeddingGenerator and
+VectorStoreCollection - never on a concrete provider/framework type.
+
+Microsoft.Extensions.AI (MEAI)
+- GetResponseAsync / GetStreamingResponseAsync (older CompleteAsync names
+  are gone). ChatClientBuilder middleware: UseFunctionInvocation (cap
+  iterations), UseOpenTelemetry (EnableSensitiveData = false), UseLogging,
+  UseDistributedCache.
+- Adapters for OpenAI, Gemini via OpenAI-compatible endpoint, Ollama.
+  Structured output via GetResponseAsync<T>. Tools via AIFunctionFactory.
+- Keyed clients for a cheap router + strong answerer.
+
+Semantic Kernel
+- Kernel = services + plugins + filters. Plugin descriptions become the tool
+  schema (descriptions are prompt engineering). FunctionChoiceBehavior
+  Auto/Required/None.
+- Filters (IFunctionInvocationFilter etc.) are where authorization, audit
+  and approval belong - not in the prompt. Log names/durations, not args.
+- Prompt templates HTML-encode variables by default; don't disable for
+  untrusted input. Kernel per request (or Clone()) to avoid lifetime bugs.
+- Use SK if you already have it; skip it for greenfield simple chat+RAG.
+
+Agent Framework (starter)
+- Package family Microsoft.Agents.AI. 1.0 naming: AIAgent, AgentSession,
+  AgentResponse, AsAIAgent(), CreateSessionAsync(). Old preview names
+  won't compile.
+- Choose: plain MEAI for Q&A/RAG/extraction; MEAI or an agent for one agent
+  with tools; Agent Framework for multi-agent/hand-off/long-running
+  workflows. Mentor note: most business features are fixed pipelines
+  (retrieve -> generate -> validate) and should be ordinary code.
+
+ML.NET
+- MLContext, IDataView, pipeline (featurize + trainer) -> Fit ->
+  Evaluate on held-out data -> Save/Load.
+- PredictionEngine is NOT thread-safe; use PredictionEnginePool in ASP.NET.
+- Example: SDCA logistic regression toxicity classifier, then a cascade
+  (>=0.95 block, <=0.05 allow, in-between goes to the LLM). ONNX Runtime for
+  pretrained models (InferenceSession is thread-safe; register as singleton).
+
+Kernel Memory
+- Ingestion + retrieval + Q&A library (extract -> partition -> embed ->
+  store; Ask with citations; Search for raw chunks; tags for filters;
+  idempotent by document ID). Serverless vs Service mode.
+- Uncertain maintenance. Recommendation: build the ~300-line pipeline
+  yourself on IChatClient + IEmbeddingGenerator + VectorData.
+
+Failure modes: outdated 2024/early-2025 tutorial code, scoped deps in
+singleton plugins, logging prompts/args (PII), shared PredictionEngine,
+auto-calling destructive tools, no tool-loop cap, adopting unmaintained
+libraries.
+
+
+CHAPTER 4 - INTEGRATION PATTERNS (RAG, VECTOR DBs, ORCHESTRATION)
+-----------------------------------------------------------------
+RAG anatomy
+- Ingestion (async): load -> clean -> chunk -> embed -> upsert with metadata.
+  Query (online): rewrite -> embed -> filtered search -> rerank -> assemble
+  context -> generate -> validate. Retrieval quality caps answer quality.
+
+Vector store choice
+- Qdrant: default for a standalone RAG service (fast filtered HNSW, easy
+  Docker, hybrid/sparse). Pinecone: managed only, namespaces as tenants,
+  lock-in. pgvector: vectors next to relational data, good under a few
+  million vectors; beware filtered-ANN returning fewer rows than LIMIT.
+  Azure AI Search: native hybrid + semantic rerank, Azure-only. In-memory:
+  tests/demos only.
+- Put the store behind VectorStoreCollection so the choice is reversible.
+
+Data model
+- DocChunk with TenantId/DocumentId/ContentHash (indexed), Source, Ordinal,
+  Text and a vector property whose dimensions match the embedding model.
+  String-typed vector property is auto-embedded via the configured
+  IEmbeddingGenerator.
+
+Chunking
+- Start with 200-500 tokens, 10-15% overlap; tune with recall@k. Fixed-size,
+  paragraph-aware, structure-aware (carry heading path - big win for
+  manuals), semantic (measure first). Store rich metadata.
+
+Ingestion
+- Deterministic IDs (hash of tenant+doc+ordinal), content-hash skip of
+  unchanged chunks, stale-chunk cleanup, batching. Never embed inside the
+  HTTP request: return 202, queue to a BackgroundService worker. In-memory
+  channel loses jobs on restart -> use a durable queue/outbox.
+
+Retrieval quality
+- Filter inside the search (not after). Hybrid search (dense + BM25) fixes
+  rare identifiers. Reciprocal Rank Fusion: score = sum 1/(k + rank).
+  Reranking (cross-encoder, hosted API, or LLM) is the best single precision
+  upgrade. Query rewriting with a cheap model. MMR for dedupe. Calibrate the
+  score threshold on your own data.
+
+Generation
+- Grounding prompt with exact refusal sentence and [n] citations. Wrap
+  retrieved chunks in tags and XML-escape them. Prompt injection is not
+  solvable by wording alone: least-privilege tools, no side effects without
+  server-side authorization, output validation (citation IDs exist, no
+  unexpected URLs), tenant filter enforced in code. Cap context, low
+  temperature, capped output.
+- Streaming /ask endpoint sends sources first, then tokens, then done.
+
+Orchestration
+- Total time budget per request, retry only idempotent calls (jitter, cap),
+  fallback models (streaming can only fail over before the first token),
+  fan-out with per-branch timeouts and partial results, budgets, exact-match
+  caching (semantic caching is risky; scope per tenant + doc version),
+  SSRF/egress allow-lists for tools (also block private/metadata IPs).
+- Code samples: FallbackChatClient, BudgetChatClient (DelegatingChatClient),
+  AllowListHandler.
+
+Evaluation
+- recall@k + MRR harness and an xUnit CI gate. Test: answerable questions,
+  unanswerable questions (must refuse), near-duplicates, an injection
+  document, and cross-tenant leakage.
+
+
+CHAPTER 5 - DEPLOYMENT & SCALING
+--------------------------------
+- Architecture: stateless API replicas + separately scaled ingestion
+  workers + durable queue + vector store + cache + OpenTelemetry + secret
+  manager.
+- Containers: multi-stage Dockerfile, chiseled aspnet image (no shell -> use
+  platform HTTP probes, not curl HEALTHCHECK), Compose for local stack.
+- Secrets: user-secrets locally; secret manager / workload identity when
+  deployed. Never in repos, image layers, clients or logs. Model IDs are
+  config; pin dated model versions (no "latest" aliases).
+- Hosting: managed container platforms are the default. Watch max request
+  duration, idle timeouts, proxy buffering (SSE), cold starts. Streaming
+  checklist: buffering off, long idle timeout, heartbeat ": ping" every
+  15-20 s.
+- Scaling: the API is I/O-bound - scale on concurrent/in-flight requests,
+  not CPU. Provider quota is usually the real bottleneck. Backpressure with
+  429 + Retry-After. Workers scale on queue depth. Keep minReplicas >= 1-2.
+- Rate limiting: per-user token bucket + global concurrency limiter. EXEMPT
+  health endpoints (DisableRateLimiting) or probes get 429 and pods restart
+  under load.
+- Health: liveness vs readiness split; NEVER call the LLM in a health check.
+- Observability: OpenTelemetry via UseOpenTelemetry (GenAI semantic
+  conventions); Aspire dashboard for local dev. Alert on p95 TTFT/latency,
+  error rate by provider/status, tokens per tenant/day, refusal rate,
+  retrieval score distribution, queue depth/age, fallback/circuit-breaker
+  events.
+- Security: OWASP Top 10 for LLM apps (2025) mapped to .NET controls.
+  Non-negotiables: authorization in code (not the prompt), tenant ID from
+  the token on every retrieval path, least-privilege store credentials,
+  decide what data may leave to providers, audit trail of IDs/metadata.
+- Cost control: output caps, top-k/context caps, cheaper models for
+  routing, per-tenant budgets, exact-match cache, cascade, batch APIs,
+  spend alerts; recompute the cost formula from measured token counts.
+- Testing: FakeChatClient for unit tests, Testcontainers for integration,
+  golden-set evals for prompt/chunking/model PRs, k6/NBomber for load, CI
+  evaluation gate. Version prompts, log prompt version + model ID per
+  request, canary model/prompt/embedding changes, rollback via config flag
+  (blue/green collections for embedding changes).
+
+
+CHAPTER 6 - CAPSTONE
+--------------------
+Tenant-isolated document Q&A service: POST /documents (async, 202,
+idempotent) and POST /ask (SSE, citations, refusals), tenant claim auth with
+two seeded tenants. Nine acceptance criteria, including: golden set of 50+
+questions (10+ unanswerable) with CI gate; cross-tenant leakage test that
+fails if the filter is removed; prompt-injection test; per-call logging of
+model ID / prompt version / tokens / latency; measured cost per query; rate
+limits + output caps + per-tenant budget; fallback for streaming and
+non-streaming; docker compose + one live cloud deployment; README with
+architecture, decisions, limitations. The most valuable README section is
+"What I measured and what I changed because of it" (e.g. recall@5 from 0.71
+to 0.83 after heading paths + hybrid search). Stretch options: pgvector swap,
+ONNX cross-encoder reranker, or an ML.NET cascade in front of the LLM.
+
+
+APPENDICES
+----------
+A. Package cheat sheet (MEAI, OpenAI adapter, VectorData + CommunityToolkit
+   connectors, Qdrant.Client, SK, Agent Framework, Kernel Memory, ML.NET,
+   ONNX Runtime, Tokenizers, System.Numerics.Tensors, Http.Resilience,
+   HybridCache, OpenTelemetry, Testcontainers) plus a table of renamed APIs
+   that break old tutorials (CompleteAsync -> GetResponseAsync,
+   AsChatClient -> AsIChatClient, SK connectors -> CommunityToolkit,
+   IMemoryStore -> VectorStore, IsFilterable -> IsIndexed, AgentThread ->
+   AgentSession, CreateAIAgent -> AsAIAgent).
+B. Production readiness checklist covering correctness, security/tenancy,
+   reliability, cost/capacity, and operations (including "runtime is
+   supported: .NET 10, or a migration date set for .NET 8/9 before Nov
+   2026").
+
+
+THE TOP 10 TAKEAWAYS
+--------------------
+ 1. Depend on IChatClient / IEmbeddingGenerator / VectorStoreCollection, not
+    on concrete providers or frameworks.
+ 2. Start new services on .NET 10; .NET 8 and 9 end support in Nov 2026.
+ 3. Every I/O call needs a CancellationToken and an explicit timeout; the
+    default 30 s resilience timeout will cut off long generations.
+ 4. Bound all concurrency - unbounded parallel LLM calls cause 429s and bills.
+ 5. Measure retrieval first (golden set, recall@k, MRR); it caps answer
+    quality. Gate CI on it.
+ 6. Tenant ID comes from the validated token and is applied inside every
+    search; test cross-tenant leakage automatically.
+ 7. Prompt injection is defended in depth (least-privilege tools, approvals,
+    output validation) - never by prompt wording.
+ 8. Set max output tokens, top-k, context, per-tenant budgets; compute cost
+    from measured tokens.
+ 9. Use a cheap classical model or router before the LLM where possible; use
+    agents only when control flow can't be written down in advance.
+10. Scale on in-flight requests / queue depth, respect provider quotas,
+    exempt health probes from rate limits, never call the LLM in probes.
+
+
+==============================================================================
+PART B - ADDITIONAL POINTS FROM ME (not in the guide)
+==============================================================================
+
+1. VERIFY BEFORE YOU BUILD
+   The guide's ecosystem table is date-sensitive (SK -> Agent Framework,
+   CommunityToolkit.VectorData.*, Kernel Memory status). Spend the first
+   hour confirming package IDs and versions on nuget.org and the GitHub repos.
+   Then build one thin end-to-end slice (ingest one doc, ask one question)
+   before investing in the full architecture. The guide itself says none of
+   its code was compiled.
+
+2. DOCUMENT PARSING IS OFTEN THE REAL BOTTLENECK
+   The guide focuses on chunking and retrieval, but in practice bad text
+   extraction (multi-column PDFs, tables, scanned pages needing OCR, headers/
+   footers repeated on every page) ruins retrieval before chunking even
+   starts. Inspect extracted text for a sample of your real documents early.
+
+3. ADD A FEEDBACK LOOP
+   Thumbs up/down and "no answer" logs from production are the best source of
+   new golden-set cases. Sample real (redacted) queries into your eval set on
+   a schedule so the golden set doesn't drift away from real usage.
+
+4. CONVERSATION STATE AND HISTORY
+   The guide's RAG sample handles a single question. Multi-turn chat needs a
+   policy for history: how much to keep, when to summarize, and how to combine
+   it with query rewriting. Also decide where history is stored (per tenant,
+   with retention limits) since it may contain sensitive data.
+
+5. PRIVACY, DELETION AND COMPLIANCE
+   Embeddings and chunks are personal/customer data too. Plan for "delete a
+   document / delete a tenant / delete a user" across the vector store, blob
+   storage, caches, logs and backups. Consider PII redaction before embedding
+   and before sending to providers. If you operate under GDPR/HIPAA/SOC 2 or
+   similar, involve the people responsible for that early. This is not legal
+   advice.
+
+6. INPUT AND OUTPUT GUARDRAILS
+   Besides the guide's output validation, consider a moderation step on user
+   input and on model output, and a length/format check on user input.
+   Layers are cheap compared with one incident.
+
+7. LOOK AT MODEL CONTEXT PROTOCOL (MCP) FOR TOOLS
+   The guide builds tools as in-process functions. If you need tools shared
+   across apps/agents, MCP is an increasingly common standard, and there is a
+   C# SDK. Check its current maturity and apply the same least-privilege and
+   approval rules.
+
+8. USE EXISTING EVALUATION TOOLING WHERE IT FITS
+   Microsoft has published evaluation libraries for the Extensions.AI stack
+   (look for Microsoft.Extensions.AI.Evaluation). Check the current status
+   and compare with your own harness before writing everything from scratch.
+   Keep the retrieval metrics (recall@k, MRR) as your own simple code so
+   they stay deterministic and cheap.
+
+9. PROVIDER-SIDE COST FEATURES
+   Prompt caching (stable system prompt + tool definitions first, variable
+   content last), batch APIs for offline work, and smaller models for
+   routing/rewriting can matter more than any code optimization. Structure
+   prompts so the static prefix stays identical between calls.
+
+10. TEST MODEL AND EMBEDDING SWAPS EARLY
+    Even if you only use one provider now, run your golden set against a
+    second model once. It shows how fragile your prompts are and makes the
+    fallback path realistic rather than theoretical. Record embedding model
+    ID and dimension per collection so migrations are safe.
+
+11. LATENCY BUDGET
+    Write down a target for time-to-first-token and total time, then allocate
+    it: rewrite + embed + search + rerank + first token. Each optional stage
+    (rewrite, rerank) has to earn its latency with measured quality gain.
+
+12. BEGINNER-FRIENDLY ORDER OF WORK
+    If you are new to this, a sensible path is:
+      a) Chapter 1 SSE endpoint + options validation + cancellation.
+      b) Chapter 2 exercises (metrics by hand, tokenizer, cost math).
+      c) Plain IChatClient RAG over a small doc set in Qdrant/pgvector.
+      d) Golden set + recall@5 measurement.
+      e) Only then hybrid search, reranking, fallback, budgets, and deploy.
+    Resist adding SK/agents until a real requirement demands them.
+
+13. WORKED ANSWER TO CHAPTER 2, EXERCISE 1
+    TP=40, FP=10, FN=20, TN=930 (total 1,000).
+      Precision = 40 / (40+10) = 0.80
+      Recall    = 40 / (40+20) = 0.667
+      F1        = 2 x 0.80 x 0.667 / (0.80 + 0.667) = 0.727
+      Accuracy  = (40+930) / 1000 = 97%
+    Accuracy looks excellent, yet a third of real positives are missed,
+    because negatives dominate the data.
+
+14. SMALL CODE-REVIEW NOTES ON THE SAMPLES
+    - RagService's MinScore (0.30) is explicitly a placeholder; calibrate it
+      on your golden set and re-check it whenever the embedding model or
+      distance function changes.
+    - The sample RAG service has an optional rerank step but doesn't
+      implement it; wire IReranker in and measure the effect.
+    - The /ask endpoint reads the tenant claim as "tid". Confirm that your
+      identity provider actually issues that claim name and that JWT claim
+      mapping in ASP.NET doesn't rename it.
+    - Add explicit request-size limits and validation to every endpoint (the
+      guide omits validation "to bury the point").
+
+==============================================================================
+END
+==============================================================================

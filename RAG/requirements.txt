@@ -1,0 +1,23 @@
+# Core LangChain
+langchain
+langchain-core
+langchain-community
+langchain-text-splitters
+
+# LLM / Embedding providers
+langchain-google-genai
+langchain-mistralai
+
+# Vector database
+chromadb
+langchain-chroma
+
+# Environment variables / secrets
+python-dotenv
+
+# Document loading
+pypdf
+
+# Optional but useful for local development / API serving
+fastapi
+uvicorn
