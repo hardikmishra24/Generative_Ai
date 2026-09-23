@@ -1,13 +1,14 @@
 from dotenv import load_dotenv
-from langchain_community.document_loaders import TextLoader
+from langchain_community.document_loaders.text import TextLoader
 from langchain_core.prompts import ChatPromptTemplate 
 from langchain.chat_models import init_chat_model
 
 
 load_dotenv()
 
-data = TextLoader(r"C:\Users\hardi\OneDrive\Desktop\Gen_Ai\RAG\document loaders\dotnet-applied-ai-summary.txt") # Creates an object of textloader class and the variable data holds the object. The object knows which file to load.
-docs = data.load()  # This method loads the document from the specified file path and returns a list of documents. Each document contains metadata and page content.
+data = TextLoader(r"C:\Users\hardi\OneDrive\Desktop\Generative_Ai\RAG\document loaders\dotnet-applied-ai-summary.txt") # Creates an object of TextLoader class named data and provides the .txt file path to TextLoader class.  
+docs = data.load() # Loads the document from the file path specified in data and returns a list of Document objects containing page content and metadata.
+
 
 template = ChatPromptTemplate.from_messages(
     [
@@ -17,6 +18,7 @@ template = ChatPromptTemplate.from_messages(
 )
 
 model = init_chat_model("google_genai:gemini-3.8-flash")
+
 # Now you're reassigning data.  
 #Before:
 #data → TextLoader object
