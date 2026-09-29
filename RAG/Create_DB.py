@@ -4,3 +4,4 @@ from dotenv import load_dotenv
 from langchain_community.document_loaders import PyPDFLoader
 from langchain.chat_models import init_chat_model
 
+from langchain_community.document_loaders import DirectoryLoader
