@@ -15,7 +15,7 @@ docs = data.load()
 
 # Split PDF into chunks
 splitter = RecursiveCharacterTextSplitter(
-    chunk_size=1000,
+    chunk_size=5000,
     chunk_overlap=200
 )
 
@@ -26,14 +26,14 @@ print("Chunks:", len(chunks))
 
 # Create embedding model
 embeddings = GoogleGenerativeAIEmbeddings(
-    model="gemini-embedding-2"
+    model="gemini-embedding-001"
 )
 
 # Create Chroma vector database
 vectorstore = Chroma.from_documents(
     chunks,
     embeddings,
-    persist_directory="Chroma_db"
+    persist_directory="VECTOR_ChromaDB"
 )
 
 print("Chroma database created successfully.")
