@@ -16,7 +16,7 @@ This repository contains modular code implementations, Jupyter notebooks, and ut
 
 ---
 
-## 🗂️ Repository Structure
+## Repository Structure
 
 ```text
 ├── 01_foundations/
