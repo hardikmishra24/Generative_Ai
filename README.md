@@ -4,7 +4,7 @@ An end-to-end hands-on repository covering LLM fundamentals, prompt engineering 
 
 ---
 
-## 📌 Overview
+ Overview
 
 This repository contains modular code implementations, Jupyter notebooks, and utility pipelines designed to bridge the gap between raw API calls and production-ready LLM application engineering. 
 
